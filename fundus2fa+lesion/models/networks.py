@@ -530,7 +530,97 @@ class GlobalGenerator(nn.Module):
         self.model = nn.Sequential(*model)
             
     def forward(self, input):
-        return self.model(input)             
+        return self.model(input)   
+
+
+ class StackConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding='same', mid_channels=None,
+            model_type='3d', residualskip=False,  device=None, dtype=None):
+        super(StackConvBlock, self).__init__()
+
+        self.change_dimension = in_channels != out_channels
+        self.model_type = model_type
+        self.residualskip = residualskip
+        padding = {'same': kernel_size//2, 'valid': 0}[padding] if padding in ['same', 'valid'] else padding
+        mid_channels = out_channels if mid_channels is None else mid_channels
+
+        if self.model_type == '3d':
+            self.ConvBlock, self.InstanceNorm = nn.Conv3d, nn.InstanceNorm3d
+        elif self.model_type == '2.5d':
+            self.ConvBlock, self.InstanceNorm = nn.Conv3d, nn.InstanceNorm3d
+        else:
+            self.ConvBlock, self.InstanceNorm = nn.Conv2d, nn.InstanceNorm2d
+
+        def extdim(krnlsz, halfdim=1):
+            return extend_by_dim(krnlsz, model_type=model_type.lower(), half_dim=halfdim)
+        self.short_cut_conv = self.ConvBlock(in_channels, out_channels, 1, extdim(stride))
+        self.norm0 = self.InstanceNorm(out_channels, affine=True)
+        self.conv1 = self.ConvBlock(in_channels, mid_channels, extdim(kernel_size), extdim(stride), padding=extdim(padding, 0), padding_mode='reflect')
+        self.norm1 = self.InstanceNorm(mid_channels, affine=True)
+        self.relu1 = nn.LeakyReLU(negative_slope=0.01, inplace=True)
+        self.conv2 = self.ConvBlock(mid_channels, out_channels, extdim(kernel_size), extdim(1), padding=extdim(padding, 0), padding_mode='reflect')
+        self.norm2 = self.InstanceNorm(out_channels, affine=True, track_running_stats=False)
+        self.relu2 = nn.LeakyReLU(negative_slope=0.01, inplace=True)
+
+    def forward(self, x):
+        if self.residualskip and self.change_dimension:
+            short_cut_conv = self.norm0(self.short_cut_conv(x))
+        else:
+            short_cut_conv = x
+        o_c1 = self.relu1(self.norm1(self.conv1(x)))
+        o_c2 = self.norm2(self.conv2(o_c1))
+        if self.residualskip:
+            out_res = self.relu2(o_c2+short_cut_conv)
+        else:
+            out_res = self.relu2(o_c2)
+        return out_res
+
+
+class GlobalResUNetGenerator(nn.Module):
+    def __init__(self, input_nc, output_nc, ngf=64, n_downsampling=4, n_blocks=9, norm_layer=nn.BatchNorm2d,
+                 padding_type='reflect'):
+        assert (n_blocks >= 0)
+        super(GlobalResUNetGenerator, self).__init__()
+        self.isresunet = True
+        self.n_downsampling = n_downsampling
+
+        self.begin_conv = StackConvBlock(input_nc, ngf, 3, 1, model_type='2d', residualskip=self.isresunet)
+        self.encoding_block = nn.ModuleList([nn.Sequential(
+            StackConvBlock(ngf * 2 ** convidx, ngf * 2 ** (convidx + 1), 3, 2, model_type='2d',
+                           residualskip=self.isresunet)) for
+            convidx in range(0, n_downsampling)])
+        trans_dim = ngf * 2 ** n_downsampling
+        self.trans_block = nn.Sequential(
+            StackConvBlock(trans_dim, trans_dim, 1, 1, model_type='2d', residualskip=self.isresunet),
+            StackConvBlock(trans_dim, trans_dim, 1, 1, model_type='2d', residualskip=self.isresunet),
+        )
+        self.decoding_block = nn.ModuleList([
+            StackConvBlock(ngf * 2 ** (convidx + 2), ngf * 2 ** convidx, 3, 1, model_type='2d',
+                           mid_channels=ngf * 2 ** (convidx + 1), residualskip=self.isresunet) for convidx in
+            range(0, n_downsampling)
+        ])
+        self.end_conv = StackConvBlock(ngf * 2, ngf, 3, 1, model_type='2d', residualskip=self.isresunet)
+        self.class_conv = nn.Conv2d(ngf, output_nc, 3, stride=1, dilation=1, padding=1, padding_mode='reflect')
+
+    def forward(self, x):
+        o_c1 = self.begin_conv(x)
+        feats = [o_c1, ]
+        for convidx in range(0, len(self.encoding_block)):
+            o_c1 = self.encoding_block[convidx](o_c1)
+            feats.append(o_c1)
+
+        o_c2 = self.trans_block(o_c1)
+        for convidx in range(self.n_downsampling, 0, -1):
+            o_c2 = torch.concat((o_c2, feats[convidx]), dim=1)
+            o_c2 = self.decoding_block[convidx - 1](o_c2)
+            o_c2 = F.interpolate(o_c2, scale_factor=2)
+
+        o_c3 = self.end_conv(torch.concat((o_c2, feats[0]), dim=1))
+        o_cls = self.class_conv(o_c3)
+        prob = nn.Tanh()(o_cls, )
+        return prob
+        
+
         
 # Define a resnet block
 class ResnetBlock(nn.Module):
